@@ -1,5 +1,92 @@
 # HANDOFF
 
+## 2026-04-13 注册页交互节奏放慢补充（以下内容补充最新状态）
+
+- 补充时间：2026-04-13
+- 触发背景：
+  - 用户反馈当前页面操作过快
+  - 可能导致页面请求过于频繁、状态尚未稳定就进入下一步，从而影响注册通过率
+
+### 本次确认的根因
+
+- `content/signup-page.js`
+  - 关键步骤里确实存在多处：
+    - 填完立即点击
+    - 点击后只等待 `200ms / 500ms / 800ms`
+    - 很快就开始判定下一阶段
+- 仓库虽然已经有：
+  - `content/utils.js -> humanPause(min, max)`
+  - 但此前几乎没有在 Step 3 / 5 / 6 的关键提交节点上使用
+
+### 本次修复
+
+- `shared/oauth-step-helpers-core.js`
+  - 新增：
+    - `getInteractionPacingProfile()`
+  - 统一定义关键阶段的人类节奏停顿区间
+
+- `shared/oauth-step-helpers-runtime.js`
+  - 同步新增同名 runtime helper，供 content script 使用
+
+- `content/signup-page.js`
+  - 新增：
+    - `pauseForInteraction(key)`
+  - 在以下关键节点接入 `utils.humanPause(...)`：
+    - Step 3：
+      - 填邮箱后
+      - 点击“继续”前
+      - 邮箱提交后
+      - 填注册密码后
+      - 点击提交前
+      - 提交注册密码后
+    - Step 5：
+      - 填姓名后
+      - 提交资料前
+      - 提交资料后
+    - Step 6：
+      - 填登录邮箱后
+      - 登录邮箱提交前后
+      - 切换一次性验证码入口前后
+      - 填登录密码后
+      - 登录密码提交前后
+
+### 当前节奏配置
+
+- `afterTyping`: `450-900ms`
+- `beforePrimaryClick`: `350-700ms`
+- `afterPrimarySubmit`: `1400-2200ms`
+- `betweenProfileFields`: `250-600ms`
+- `beforeProfileSubmit`: `600-1100ms`
+- `afterProfileSubmit`: `1500-2400ms`
+- `afterLoginSwitch`: `1200-1800ms`
+
+### 修复后的行为
+
+- 关键提交动作不再是“刚填完就秒点”
+- 点击后也会给页面更长时间自行跳转 / 发请求 / 稳定 DOM
+- 整体节奏更接近手动操作
+
+### 本次修改的关键文件
+
+- `shared/oauth-step-helpers-core.js`
+- `shared/oauth-step-helpers-runtime.js`
+- `content/signup-page.js`
+- `tests/oauth-step-helpers.test.js`
+
+### fresh 验证证据
+
+```bash
+node --test tests/oauth-step-helpers.test.js
+node --test tests/auto-flow.test.js tests/continue-auto-flow.test.js
+node --check content/signup-page.js shared/oauth-step-helpers-core.js shared/oauth-step-helpers-runtime.js
+```
+
+结果：
+
+- 新增的交互节奏配置测试通过
+- 自动流程与继续流程回归测试通过
+- 相关文件语法检查通过
+
 ## 2026-04-13 create-account 注册密码页误判为登录页补充（以下内容补充最新状态）
 
 - 补充时间：2026-04-13
