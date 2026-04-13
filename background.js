@@ -1,4 +1,11 @@
-import { markAccountStatus, resolveCurrentAccountSelection } from './shared/account-ledger.js';
+import {
+  findAvailableAccountByAddress,
+  listAvailableAccounts,
+  listSkippedAccounts,
+  markAccountStatus,
+  resolveCurrentAccountSelection,
+  summarizeAccountAvailability,
+} from './shared/account-ledger.js';
 import { continueSingleAutoFlow, runAutoFlowBatch, runSingleAutoFlow } from './shared/auto-flow.js';
 import { createAutoRunPausedError } from './shared/auto-run-control.js';
 import { buildAutoRestartRuntimeUpdates } from './shared/auto-restart.js';
@@ -13,6 +20,7 @@ import { buildPanelTabOpenPlan } from './shared/panel-tab-plan.js';
 import { decideStep8ClickPlan } from './shared/step8-click-plan.js';
 import { pollVerificationCode } from './shared/verification-poller.js';
 import { createReadyCommandQueue } from './shared/ready-command-queue.js';
+import { isMissingReceiverError } from './shared/runtime-message-errors.js';
 import { executeSignupStepCommand } from './shared/signup-step-executor.js';
 import { DEFAULT_RUNTIME, DEFAULT_SETTINGS, mergeLogs, sanitizeSettings } from './shared/state-machine.js';
 import { pollVerificationCodeWithResend } from './shared/verification-recovery.js';
@@ -57,6 +65,7 @@ async function setRuntime(updates) {
 
 async function resetTransientRuntime() {
   await setRuntime({
+    selectedAccountAddress: '',
     currentAccount: null,
     currentEmailRecord: null,
     authTabId: null,
@@ -210,14 +219,42 @@ function buildClient(settings) {
   });
 }
 
+function getSelectedAccountAddress(state = {}) {
+  return String(state.selectedAccountAddress || '').trim().toLowerCase();
+}
+
+async function resolvePinnedAccountSelection(state, accounts = []) {
+  const selectedAddress = getSelectedAccountAddress(state);
+  if (!selectedAddress) {
+    return null;
+  }
+
+  const selection = findAvailableAccountByAddress(
+    accounts,
+    state.usedAccounts || {},
+    selectedAddress
+  );
+  if (selection) {
+    return selection;
+  }
+
+  await setRuntime({
+    selectedAccountAddress: '',
+    currentAccount: null,
+    currentEmailRecord: null,
+  });
+  throw new Error(`手动指定邮箱不可用：${selectedAddress}，它可能已被标记为已使用或已注册`);
+}
+
 async function resolveCurrentAccount(state) {
   const client = buildClient(state);
   const accounts = await client.listAccounts();
-  const selection = resolveCurrentAccountSelection({
-    accounts,
-    ledger: state.usedAccounts || {},
-    startIndex: state.currentAccountIndex,
-  });
+  const selection = await resolvePinnedAccountSelection(state, accounts)
+    || resolveCurrentAccountSelection({
+      accounts,
+      ledger: state.usedAccounts || {},
+      startIndex: state.currentAccountIndex,
+    });
   const account = selection?.account || null;
   if (!account) {
     throw new Error('没有可用邮箱，可能 Outlook API 中的邮箱都已打上“已注册”标签或已被跳过');
@@ -265,11 +302,6 @@ async function getActiveAuthTab() {
     await setRuntime({ authTabId: tab.id });
   }
   return tab;
-}
-
-function isMissingReceiverError(error) {
-  const message = error?.message || String(error);
-  return /Receiving end does not exist|message channel is closed|back\/forward cache|extension port/i.test(message);
 }
 
 async function waitForTabComplete(tabId, timeoutMs = 15000) {
@@ -589,6 +621,7 @@ async function performAutoRestart(mode, state) {
 
   await setRuntime({
     ...runtimeUpdates,
+    ...(mode === 'next' ? { selectedAccountAddress: '' } : {}),
     autoCurrentRun: latestState.autoCurrentRun || 1,
     autoTotalRuns: latestState.autoTotalRuns || latestState.runCount,
     pendingAutoAction: '',
@@ -754,6 +787,55 @@ const handlers = {
     await addLog(`邮箱池已从 Outlook API 拉取完成，共 ${accounts.length} 条`, 'ok');
     return { count: accounts.length, first: accounts[0] || null };
   },
+  async LIST_AVAILABLE_ACCOUNTS(payload) {
+    const state = await getState();
+    const accounts = await buildClient(state).listAccounts();
+    const availableAccounts = listAvailableAccounts(accounts, state.usedAccounts || {}, {
+      query: payload?.query || '',
+      limit: 30,
+    }).map((account) => ({
+      address: account.address,
+      provider: account.provider || '',
+      groupName: account.groupName || '',
+      isTemp: Boolean(account.isTemp),
+    }));
+    return {
+      accounts: availableAccounts,
+      selectedAccountAddress: getSelectedAccountAddress(state),
+    };
+  },
+  async SELECT_ACCOUNT(payload) {
+    const state = await getState();
+    const requestedAddress = String(payload?.address || '').trim().toLowerCase();
+
+    if (!requestedAddress) {
+      await setRuntime({
+        selectedAccountAddress: '',
+        currentAccount: null,
+        currentEmailRecord: null,
+      });
+      await addLog('已清除手动指定邮箱', 'info');
+      return { selectedAccountAddress: '' };
+    }
+
+    const accounts = await buildClient(state).listAccounts();
+    const selection = findAvailableAccountByAddress(accounts, state.usedAccounts || {}, requestedAddress);
+    if (!selection?.account?.address) {
+      throw new Error(`未找到可用邮箱：${requestedAddress}`);
+    }
+
+    await setRuntime({
+      selectedAccountAddress: selection.account.address,
+      currentAccount: selection.account,
+      currentAccountIndex: selection.index,
+      currentEmailRecord: null,
+    });
+    await addLog(`已手动指定邮箱：${selection.account.address}`, 'ok');
+    return {
+      selectedAccountAddress: selection.account.address,
+      account: selection.account,
+    };
+  },
   async GET_OAUTH_FROM_VPS() {
     const state = await getState();
     if (!state.vpsUrl) {
@@ -785,13 +867,26 @@ const handlers = {
     const state = await getState();
     await addLog('准备账号：正在从邮箱平台拉取可用账号...', 'info');
     const accounts = await buildClient(state).listAccounts();
-    const selection = resolveCurrentAccountSelection({
-      accounts,
-      ledger: state.usedAccounts || {},
-      startIndex: state.currentAccountIndex,
-    });
+    const selection = await resolvePinnedAccountSelection(state, accounts)
+      || resolveCurrentAccountSelection({
+        accounts,
+        ledger: state.usedAccounts || {},
+        startIndex: state.currentAccountIndex,
+      });
     const match = selection?.account || null;
     if (!match?.address) {
+      const summary = summarizeAccountAvailability(accounts, state.usedAccounts || {});
+      const skipped = listSkippedAccounts(accounts, state.usedAccounts || {});
+      await addLog(
+        `准备账号：本次共扫描 ${summary.total} 个邮箱，本地已用 ${summary.completedInLedger} 个，已注册标签 ${summary.taggedRegistered} 个，可用 ${summary.available} 个。`,
+        'warn'
+      );
+      if (skipped.completedInLedger.length) {
+        await addLog(`准备账号：被本地账本跳过的邮箱：${skipped.completedInLedger.join(', ')}`, 'warn');
+      }
+      if (skipped.taggedRegistered.length) {
+        await addLog(`准备账号：被“已注册”标签跳过的邮箱：${skipped.taggedRegistered.join(', ')}`, 'warn');
+      }
       throw new Error('没有更多未注册邮箱可用');
     }
     await setRuntime({
@@ -804,6 +899,7 @@ const handlers = {
   },
   async ADVANCE_ACCOUNT() {
     const state = await getState();
+    await setRuntime({ selectedAccountAddress: '' });
     const accounts = await buildClient(state).listAccounts();
     const selection = resolveCurrentAccountSelection({
       accounts,
@@ -815,6 +911,7 @@ const handlers = {
       throw new Error('没有更多未注册邮箱可用');
     }
     await setRuntime({
+      selectedAccountAddress: '',
       currentAccountIndex: selection.index,
       currentAccount: nextAccount,
       currentEmailRecord: null,

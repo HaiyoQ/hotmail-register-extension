@@ -1,5 +1,226 @@
 # HANDOFF
 
+## 2026-04-13 指定邮箱面板折叠与位置调整补充（以下内容补充最新状态）
+
+- 补充时间：2026-04-13
+- 触发背景：
+  - 用户希望“指定邮箱”区域默认折叠
+  - 并且放到“常用配置”下面
+  - 未指定时文案明确为默认使用第一个可用邮箱
+  - 指定时继续按已有邮箱执行
+
+### 本次调整
+
+- `sidepanel/sidepanel.html`
+  - 将“指定邮箱”从原先顶部独立卡片，移动到“常用配置”卡片下方
+  - 改为默认折叠的 `<details class="card picker-card">`
+  - 摘要区改成更轻量的小字提示：
+    - `可选项，不指定时默认使用第一个可用邮箱`
+    - `展开后搜索并指定已有邮箱`
+
+- `sidepanel/sidepanel.css`
+  - 新增折叠摘要样式：
+    - `picker-summary`
+    - `picker-summary-main`
+    - `picker-summary-title`
+    - `picker-summary-caption`
+    - `picker-body`
+  - 将指定邮箱区的提示与结果元信息字号整体调小
+
+- `sidepanel/sidepanel.js`
+  - 未指定邮箱时的提示改为：
+    - `未指定：将使用第一个可用邮箱`
+  - 列表状态文案改为：
+    - 无搜索词时提示当前显示前 N 个可用邮箱，未指定时默认使用第一个
+  - 清除指定后的提示改为：
+    - `已清除指定邮箱，将改用第一个可用邮箱`
+  - 后台选择逻辑未改，仍保持：
+    - 未指定时使用第一个可用邮箱
+    - 指定时按所选已有邮箱执行
+
+### 本次修改的关键文件
+
+- `sidepanel/sidepanel.html`
+- `sidepanel/sidepanel.css`
+- `sidepanel/sidepanel.js`
+- `tests/sidepanel-structure.test.js`
+
+### fresh 验证证据
+
+```bash
+node --test tests/sidepanel-structure.test.js
+node --check sidepanel/sidepanel.js
+node --check background.js
+```
+
+结果：
+
+- 结构测试通过
+- 侧边栏与后台脚本语法检查通过
+
+## 2026-04-13 步骤 2 异步消息通道误判失败补充（以下内容补充最新状态）
+
+- 补充时间：2026-04-13
+- 触发背景：
+  - 用户在真实联调里，步骤 2 已点击注册入口后报错：
+    - `A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received`
+  - 同一轮日志随后又出现：
+    - `页面内步骤 2 已完成`
+  - 现象表现为：
+    - 自动流程先把步骤 2 判失败并停止
+    - 但页面实际上已经成功进入注册流程
+
+### 本次确认的根因
+
+- 步骤 2 / 3 走的是“页面驱动完成”链路：
+  - 后台先 `waitForStep(step)`
+  - 再异步 `chrome.tabs.sendMessage(...)`
+  - 页面成功后会主动回发 `STEP_COMPLETE`
+
+- 问题不在 `content/signup-page.js` 的业务逻辑本身，而在后台对消息通道异常的分类不完整：
+  - `background.js` 之前只把以下错误视为“页面切换期间可忽略的临时断链”
+    - `Receiving end does not exist`
+    - `message channel is closed`
+    - `back/forward cache`
+    - `extension port`
+  - 但 Chrome 现在还会抛出另一类等价错误：
+    - `A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received`
+
+- 结果：
+  - 后台在 `executeSignupStepCommand(...).catch(...)` 中把这条错误当成真实失败
+  - 先执行 `contentStepSignals.rejectStep(step, error)`
+  - 之后页面又正常上报 `STEP_COMPLETE`
+  - 于是日志出现“先失败、后完成”的矛盾状态
+
+### 本次修复
+
+- 新增 `shared/runtime-message-errors.js`
+  - 统一封装 `isMissingReceiverError(error)`
+  - 补齐对以下 Chrome 文案的识别：
+    - `message channel closed before a response was received`
+    - `indicated an asynchronous response`
+
+- `background.js`
+  - 改为复用共享的 `isMissingReceiverError`
+  - 这样在步骤 2 / 3 页面跳转期间，如果只是消息通道短暂断开，后台会继续等待 `STEP_COMPLETE`，不会抢先把步骤判失败
+
+### 本次修改的关键文件
+
+- `shared/runtime-message-errors.js`
+- `background.js`
+- `tests/runtime-message-errors.test.js`
+
+### fresh 验证证据
+
+```bash
+node --test tests/runtime-message-errors.test.js tests/content-step-signals.test.js tests/step-execution.test.js
+node --check background.js
+node --check shared/runtime-message-errors.js
+npm test
+find . -name '*.js' -not -path './.git/*' -print0 | xargs -0 -n1 node --check
+```
+
+结果：
+
+- 新增的消息通道错误识别测试通过
+- 步骤信号与步骤派发相关现有测试通过
+- 全量 `122/122` 通过
+- 全仓 JS 语法检查通过
+
+## 2026-04-13 手动搜索并指定邮箱补充（以下内容补充最新状态）
+
+- 补充时间：2026-04-13
+- 触发背景：
+  - 用户希望不要每次都只能随机/顺序拿邮箱
+  - 需要在 Side Panel 里手动搜索现有邮箱，并点选一个已有邮箱来跑
+
+### 本次实现的能力
+
+- `sidepanel/sidepanel.html`
+  - 新增 `指定邮箱` 卡片
+  - 包含：
+    - 搜索输入框 `account-search`
+    - 搜索结果列表 `account-search-results`
+    - 清除指定按钮 `clear-selected-account`
+
+- `sidepanel/sidepanel.js`
+  - 新增邮箱搜索结果刷新逻辑：
+    - 通过后台消息 `LIST_AVAILABLE_ACCOUNTS` 拉取“当前可用邮箱”
+    - 输入关键字后按邮箱地址 / alias / provider / groupName 过滤
+  - 新增点选逻辑：
+    - 点击某个邮箱后调用 `SELECT_ACCOUNT`
+    - Side Panel 会显示：
+      - `已指定：<email>`
+  - 新增清除逻辑：
+    - 点击 `清除指定` 后恢复为原来的顺序选邮箱模式
+
+- `background.js`
+  - runtime 新增：
+    - `selectedAccountAddress`
+  - 新增后台消息：
+    - `LIST_AVAILABLE_ACCOUNTS`
+    - `SELECT_ACCOUNT`
+  - `resolveCurrentAccount()` / `PREPARE_NEXT_ACCOUNT()`
+    - 现在会优先消费 `selectedAccountAddress`
+    - 若手动指定邮箱仍可用，则直接命中该邮箱
+    - 若手动指定邮箱已不可用（例如已完成或带 `已注册` 标签），会清空指定并报出明确错误
+  - `RESTART_WITH_NEXT_ACCOUNT` / `ADVANCE_ACCOUNT`
+    - 会清空手动指定邮箱
+    - 回到原来的“下一个账号”顺序逻辑
+  - `COMPLETE_CURRENT_ACCOUNT`
+    - 完成当前账号后会清空手动指定邮箱，避免下一轮继续锁死在已完成账号
+
+- `shared/account-ledger.js`
+  - 新增通用 helper：
+    - `findAvailableAccountByAddress()`
+    - `listAvailableAccounts()`
+  - 把“是否可用邮箱”的判断统一沉到共享层，供后台手动指定与列表过滤复用
+
+### 修复后的行为
+
+- 默认模式：
+  - 仍按原有顺序自动取可用邮箱
+
+- 手动指定模式：
+  - 在侧边栏搜索邮箱
+  - 点选某个结果后，自动流程/手动步骤都会优先使用这个邮箱
+
+- 点击 `下一个账号`：
+  - 清空当前手动指定
+  - 从后一个游标位置继续顺序选账号
+
+- 完成流程后：
+  - 清空当前手动指定
+  - 防止下一轮继续选中刚完成的邮箱
+
+### 本次修改的关键文件
+
+- `sidepanel/sidepanel.html`
+- `sidepanel/sidepanel.css`
+- `sidepanel/sidepanel.js`
+- `background.js`
+- `shared/state-machine.js`
+- `shared/account-ledger.js`
+- `tests/account-ledger.test.js`
+- `tests/sidepanel-structure.test.js`
+
+### fresh 验证证据
+
+```bash
+node --test tests/account-ledger.test.js tests/sidepanel-structure.test.js
+node --check background.js
+node --check sidepanel/sidepanel.js
+node --check shared/account-ledger.js
+node --check shared/state-machine.js
+npm test
+```
+
+结果：
+
+- 新增账号搜索/点选相关测试通过
+- 修改文件语法检查通过
+- 全量 `119/119` 通过
+
 ## 2026-04-13 临时邮箱接入补充（以下内容补充最新状态）
 
 - 补充时间：2026-04-13

@@ -89,6 +89,27 @@
 
       </section>
 
+      <details class="card picker-card">
+        <summary class="picker-summary">
+          <span class="picker-summary-main">
+            <span class="picker-summary-title">指定邮箱</span>
+            <span class="picker-summary-caption">可选项，不指定时默认使用第一个可用邮箱</span>
+          </span>
+          <span class="summary-tip">展开后搜索并指定已有邮箱</span>
+        </summary>
+
+        <div class="picker-body">
+          <div class="picker-toolbar">
+            <input id="account-search" class="data-input mono" type="text" placeholder="可直接看列表，也可输入关键字筛选已有邮箱">
+            <button id="clear-selected-account" class="btn btn-ghost btn-xs" type="button">清除指定</button>
+          </div>
+
+          <div id="selected-account-hint" class="picker-selected">未指定：将使用第一个可用邮箱</div>
+          <div id="account-search-status" class="picker-status">正在准备可用邮箱列表...</div>
+          <div id="account-search-results" class="picker-results"></div>
+        </div>
+      </details>
+
       <details class="card advanced-panel">
         <summary>
           <span>高级 / 手动调试</span>

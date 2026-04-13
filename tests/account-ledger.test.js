@@ -2,10 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  findAvailableAccountByAddress,
   findNextAvailableAccount,
   getAccountStatus,
+  listAvailableAccounts,
   markAccountStatus,
+  listSkippedAccounts,
   resolveCurrentAccountSelection,
+  summarizeAccountAvailability,
 } from '../shared/account-ledger.js';
 
 test('findNextAvailableAccount skips completed accounts', () => {
@@ -95,5 +99,90 @@ test('resolveCurrentAccountSelection falls back to the beginning when startIndex
   assert.deepEqual(result, {
     account: { address: 'duck@cstea.shop', tags: [] },
     index: 0,
+  });
+});
+
+test('findAvailableAccountByAddress returns selectable account by exact address', () => {
+  const accounts = [
+    { address: 'done@outlook.com', tags: [] },
+    { address: 'fresh@outlook.com', tags: [] },
+  ];
+  const ledger = {
+    'done@outlook.com': { status: 'completed' },
+  };
+
+  const result = findAvailableAccountByAddress(accounts, ledger, 'fresh@outlook.com');
+
+  assert.deepEqual(result, {
+    account: { address: 'fresh@outlook.com', tags: [] },
+    index: 1,
+  });
+});
+
+test('findAvailableAccountByAddress returns null when address is already unavailable', () => {
+  const accounts = [
+    { address: 'done@outlook.com', tags: [] },
+    { address: 'tagged@outlook.com', tags: [{ name: '已注册' }] },
+  ];
+  const ledger = {
+    'done@outlook.com': { status: 'completed' },
+  };
+
+  assert.equal(findAvailableAccountByAddress(accounts, ledger, 'done@outlook.com'), null);
+  assert.equal(findAvailableAccountByAddress(accounts, ledger, 'tagged@outlook.com'), null);
+});
+
+test('listAvailableAccounts filters by query and excludes unavailable accounts', () => {
+  const accounts = [
+    { address: 'done@outlook.com', provider: 'outlook', tags: [] },
+    { address: 'fresh@duckmail.live', provider: 'duckmail', tags: [] },
+    { address: 'tagged@gptmail.one', provider: 'gptmail', tags: [{ name: '已注册' }] },
+  ];
+  const ledger = {
+    'done@outlook.com': { status: 'completed' },
+  };
+
+  const result = listAvailableAccounts(accounts, ledger, { query: 'duck' });
+
+  assert.deepEqual(result, [
+    { address: 'fresh@duckmail.live', provider: 'duckmail', tags: [] },
+  ]);
+});
+
+test('summarizeAccountAvailability counts ledger skips and 已注册 tag skips separately', () => {
+  const accounts = [
+    { address: 'done@outlook.com', tags: [] },
+    { address: 'tagged@outlook.com', tags: [{ name: '已注册' }] },
+    { address: 'fresh@outlook.com', tags: [] },
+  ];
+  const ledger = {
+    'done@outlook.com': { status: 'completed' },
+  };
+
+  const result = summarizeAccountAvailability(accounts, ledger);
+
+  assert.deepEqual(result, {
+    total: 3,
+    completedInLedger: 1,
+    taggedRegistered: 1,
+    available: 1,
+  });
+});
+
+test('listSkippedAccounts returns skipped addresses grouped by reason', () => {
+  const accounts = [
+    { address: 'done@outlook.com', tags: [] },
+    { address: 'tagged@outlook.com', tags: [{ name: '已注册' }] },
+    { address: 'fresh@outlook.com', tags: [] },
+  ];
+  const ledger = {
+    'done@outlook.com': { status: 'completed' },
+  };
+
+  const result = listSkippedAccounts(accounts, ledger);
+
+  assert.deepEqual(result, {
+    completedInLedger: ['done@outlook.com'],
+    taggedRegistered: ['tagged@outlook.com'],
   });
 });

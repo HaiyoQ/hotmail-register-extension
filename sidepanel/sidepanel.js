@@ -87,6 +87,11 @@ const elements = {
   autoRunButton: $('auto-run-current'),
   restartCurrentButton: $('restart-current-run'),
   restartNextButton: $('restart-next-account'),
+  accountSearchInput: $('account-search'),
+  accountSearchStatus: $('account-search-status'),
+  accountSearchResults: $('account-search-results'),
+  selectedAccountHint: $('selected-account-hint'),
+  clearSelectedAccountButton: $('clear-selected-account'),
 };
 
 let latestState = null;
@@ -94,6 +99,10 @@ let formDirty = false;
 let formHydrated = false;
 let refreshInFlight = false;
 let refreshTimer = null;
+let accountSearchResults = [];
+let accountSearchLoading = false;
+let accountSearchRequestId = 0;
+let accountSearchDebounceTimer = null;
 
 async function call(type, payload) {
   const response = await chrome.runtime.sendMessage({ type, payload });
@@ -268,6 +277,76 @@ function renderLogs(state) {
   });
 }
 
+function formatAccountMeta(account = {}) {
+  const meta = [];
+  if (account.provider) {
+    meta.push(account.provider);
+  }
+  if (account.groupName) {
+    meta.push(account.groupName);
+  }
+  if (account.isTemp) {
+    meta.push('临时邮箱');
+  }
+  return meta.join(' · ');
+}
+
+function renderAccountPicker(state = latestState) {
+  const input = elements.accountSearchInput;
+  const status = elements.accountSearchStatus;
+  const results = elements.accountSearchResults;
+  const selectedHint = elements.selectedAccountHint;
+  const clearButton = elements.clearSelectedAccountButton;
+  if (!input || !status || !results || !selectedHint || !clearButton) {
+    return;
+  }
+
+  const locked = Boolean(state?.autoRunning || state?.autoPaused);
+  const selectedAddress = String(state?.selectedAccountAddress || '').trim();
+  const query = input.value.trim();
+
+  input.disabled = locked;
+  if (!isButtonBusy(clearButton)) {
+    clearButton.disabled = locked || !selectedAddress;
+  }
+
+  selectedHint.textContent = selectedAddress
+    ? `已指定：${selectedAddress}`
+    : '未指定：将使用第一个可用邮箱';
+  selectedHint.classList.toggle('is-active', Boolean(selectedAddress));
+
+  if (accountSearchLoading) {
+    status.textContent = '正在加载可用邮箱...';
+  } else if (!accountSearchResults.length && query) {
+    status.textContent = `没有匹配 “${query}” 的可用邮箱`;
+  } else if (!accountSearchResults.length) {
+    status.textContent = '暂无可用邮箱，请检查邮箱平台或更换关键字';
+  } else {
+    status.textContent = query
+      ? `当前显示 ${accountSearchResults.length} 个匹配邮箱，点击即可指定`
+      : `当前显示前 ${accountSearchResults.length} 个可用邮箱，未指定时默认使用第一个`;
+  }
+
+  results.innerHTML = accountSearchResults.map((account) => {
+    const active = account.address === selectedAddress;
+    const meta = formatAccountMeta(account);
+    return `
+      <button
+        class="picker-result ${active ? 'is-active' : ''}"
+        type="button"
+        data-account-address="${escapeHtml(account.address)}"
+        ${locked ? 'disabled' : ''}
+      >
+        <span class="picker-result-main">
+          <span class="picker-result-address mono">${escapeHtml(account.address)}</span>
+          ${meta ? `<span class="picker-result-meta">${escapeHtml(meta)}</span>` : ''}
+        </span>
+        <span class="picker-result-action">${active ? '已选中' : '选择'}</span>
+      </button>
+    `;
+  }).join('');
+}
+
 function buildPlainLogs(state = latestState) {
   const logs = state?.logs || [];
   return logs.map((entry) => {
@@ -305,6 +384,7 @@ function renderState(state) {
 
   renderSteps(state);
   renderLogs(state);
+  renderAccountPicker(state);
   updateAutoRunButton(state);
   updateRecoveryButton(state);
   updateSaveUI();
@@ -468,6 +548,94 @@ function updateActionAvailability(state = latestState) {
   });
   updateSaveUI();
   updateAutoRunButton(state);
+  renderAccountPicker(state);
+}
+
+async function refreshAccountSearchResults({ silent = false } = {}) {
+  if (!elements.accountSearchInput) {
+    return;
+  }
+
+  const requestId = ++accountSearchRequestId;
+  accountSearchLoading = true;
+  renderAccountPicker(latestState);
+
+  try {
+    const data = await call('LIST_AVAILABLE_ACCOUNTS', {
+      query: elements.accountSearchInput.value.trim(),
+    });
+    if (requestId !== accountSearchRequestId) {
+      return;
+    }
+    accountSearchResults = Array.isArray(data?.accounts) ? data.accounts : [];
+  } catch (error) {
+    if (requestId !== accountSearchRequestId) {
+      return;
+    }
+    accountSearchResults = [];
+    if (!silent) {
+      showToast(`邮箱搜索失败：${error.message}`, 'error', 3200);
+    }
+  } finally {
+    if (requestId === accountSearchRequestId) {
+      accountSearchLoading = false;
+      renderAccountPicker(latestState);
+    }
+  }
+}
+
+function scheduleAccountSearchRefresh() {
+  clearTimeout(accountSearchDebounceTimer);
+  accountSearchDebounceTimer = setTimeout(() => {
+    refreshAccountSearchResults({ silent: true }).catch(() => {});
+  }, 180);
+}
+
+async function selectAccount(address, button) {
+  if (!address) {
+    return;
+  }
+
+  try {
+    if (button) {
+      setButtonBusy(button, true, '选择中...');
+    }
+    await call('SELECT_ACCOUNT', { address });
+    await refreshState();
+    await refreshAccountSearchResults({ silent: true });
+    showToast(`已指定邮箱：${address}`, 'success');
+    if (button) {
+      flashButton(button, 'is-success');
+    }
+  } catch (error) {
+    if (button) {
+      flashButton(button, 'is-error');
+    }
+    showToast(error.message, 'error', 3200);
+  } finally {
+    if (button) {
+      setButtonBusy(button, false);
+    }
+    renderAccountPicker(latestState);
+  }
+}
+
+async function clearSelectedAccount() {
+  const button = elements.clearSelectedAccountButton;
+  try {
+    setButtonBusy(button, true, '清除中...');
+    await call('SELECT_ACCOUNT', { address: '' });
+    await refreshState();
+    await refreshAccountSearchResults({ silent: true });
+    showToast('已清除指定邮箱，将改用第一个可用邮箱', 'success');
+    flashButton(button, 'is-success');
+  } catch (error) {
+    flashButton(button, 'is-error');
+    showToast(error.message, 'error', 3200);
+  } finally {
+    setButtonBusy(button, false);
+    renderAccountPicker(latestState);
+  }
 }
 
 function bindAction(id, type, options) {
@@ -554,6 +722,25 @@ elements.restartNextButton?.addEventListener('click', () => {
     loadingText: '切换中...',
     launchMessage: '已处理下一个账号请求',
   }).catch(() => {});
+});
+
+elements.accountSearchInput?.addEventListener('input', () => {
+  scheduleAccountSearchRefresh();
+});
+
+elements.accountSearchResults?.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-account-address]');
+  if (!(button instanceof HTMLButtonElement) || isButtonBusy(button)) {
+    return;
+  }
+  selectAccount(button.dataset.accountAddress || '', button).catch(() => {});
+});
+
+elements.clearSelectedAccountButton?.addEventListener('click', () => {
+  if (isButtonBusy(elements.clearSelectedAccountButton)) {
+    return;
+  }
+  clearSelectedAccount().catch(() => {});
 });
 
 bindAction('step-1', 'GET_OAUTH_FROM_VPS', {
@@ -679,4 +866,5 @@ elements.toggleVpsPasswordButton?.addEventListener('click', () => {
 });
 
 refreshState().catch(() => {});
+refreshAccountSearchResults({ silent: true }).catch(() => {});
 startRefreshLoop();

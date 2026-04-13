@@ -20,6 +20,7 @@ export const DEFAULT_SETTINGS = {
 
 export const DEFAULT_RUNTIME = {
   currentAccountIndex: 0,
+  selectedAccountAddress: '',
   currentAccount: null,
   currentEmailRecord: null,
   authTabId: null,
